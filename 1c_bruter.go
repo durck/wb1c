@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
@@ -30,6 +31,11 @@ import (
 
 // FIXED_IV используется для AES-CBC (для совместимости с 1С)
 var FIXED_IV = []byte{157, 123, 154, 32, 105, 101, 187, 40, 6, 122, 72, 61, 178, 108, 113, 142}
+
+type job struct {
+	username string
+	password string
+}
 
 // httpClient с поддержкой TLS 1.0+ и самоподписанных корпоративных сертификатов
 var httpClient = &http.Client{
@@ -208,21 +214,159 @@ func checkCredentials(baseURL, version, username, password string) bool {
 	return ok
 }
 
-// loadLinesFromFile загружает строки из файла.
+// decodeUTF16LE декодирует байты UTF-16 LE в строку.
+func decodeUTF16LE(b []byte) string {
+	if len(b)%2 != 0 {
+		b = b[:len(b)-1]
+	}
+	runes := make([]rune, len(b)/2)
+	for i := range runes {
+		runes[i] = rune(b[2*i]) | rune(b[2*i+1])<<8
+	}
+	return string(runes)
+}
+
+// decodeUTF16BE декодирует байты UTF-16 BE в строку.
+func decodeUTF16BE(b []byte) string {
+	if len(b)%2 != 0 {
+		b = b[:len(b)-1]
+	}
+	runes := make([]rune, len(b)/2)
+	for i := range runes {
+		runes[i] = rune(b[2*i])<<8 | rune(b[2*i+1])
+	}
+	return string(runes)
+}
+
+// decodeTextBytes определяет кодировку по BOM и возвращает текст в UTF-8.
+func decodeTextBytes(data []byte) string {
+	switch {
+	case bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}):
+		return string(data[3:]) // UTF-8 BOM
+	case bytes.HasPrefix(data, []byte{0xFF, 0xFE}):
+		return decodeUTF16LE(data[2:]) // UTF-16 LE
+	case bytes.HasPrefix(data, []byte{0xFE, 0xFF}):
+		return decodeUTF16BE(data[2:]) // UTF-16 BE
+	default:
+		return string(data)
+	}
+}
+
+// parseLines разбивает текст на непустые очищенные строки.
+func parseLines(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	var result []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || !unicode.IsPrint(r) {
+				return -1
+			}
+			return r
+		}, line)
+		line = strings.TrimSpace(line)
+		if line != "" {
+			result = append(result, line)
+		}
+	}
+	return result
+}
+
+// loadLinesFromFile загружает строки из файла с поддержкой UTF-8, UTF-8 BOM, UTF-16 LE/BE.
 func loadLinesFromFile(filename string) ([]string, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
-	lines := strings.Split(string(data), "\n")
-	var trimmed []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			trimmed = append(trimmed, line)
+	return parseLines(decodeTextBytes(data)), nil
+}
+
+// countPasswordFileLines считает непустые строки в файле не загружая его в память (UTF-8/UTF-8 BOM).
+// Для UTF-16 файлов делает полную загрузку (они обычно небольшие).
+func countPasswordFileLines(filename string) int {
+	f, err := os.Open(filename)
+	if err != nil {
+		return 0
+	}
+	bom := make([]byte, 3)
+	n, _ := f.Read(bom)
+	f.Close()
+	bom = bom[:n]
+
+	isUTF16 := (n >= 2 && bom[0] == 0xFF && bom[1] == 0xFE) ||
+		(n >= 2 && bom[0] == 0xFE && bom[1] == 0xFF)
+	if isUTF16 {
+		lines, err := loadLinesFromFile(filename)
+		if err != nil {
+			return 0
+		}
+		return len(lines)
+	}
+
+	f2, err := os.Open(filename)
+	if err != nil {
+		return 0
+	}
+	defer f2.Close()
+	if n >= 3 && bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
+		f2.Seek(3, io.SeekStart)
+	}
+	scanner := bufio.NewScanner(f2)
+	count := 0
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) != "" {
+			count++
 		}
 	}
-	return trimmed, nil
+	return count
+}
+
+// feedPasswordsFromFile читает файл паролей построчно и отправляет задачи в канал.
+// UTF-8 файлы читаются потоком без загрузки в память; UTF-16 загружаются полностью.
+func feedPasswordsFromFile(filename string, users []string, jobs chan<- job) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	bom := make([]byte, 3)
+	n, _ := f.Read(bom)
+	f.Close()
+	bom = bom[:n]
+
+	isUTF16 := (n >= 2 && bom[0] == 0xFF && bom[1] == 0xFE) ||
+		(n >= 2 && bom[0] == 0xFE && bom[1] == 0xFF)
+	if isUTF16 {
+		lines, err := loadLinesFromFile(filename)
+		if err != nil {
+			return err
+		}
+		for _, password := range lines {
+			for _, username := range users {
+				jobs <- job{username, password}
+			}
+		}
+		return nil
+	}
+
+	f2, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer f2.Close()
+	if n >= 3 && bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
+		f2.Seek(3, io.SeekStart)
+	}
+	scanner := bufio.NewScanner(f2)
+	for scanner.Scan() {
+		password := strings.TrimSpace(scanner.Text())
+		if password == "" {
+			continue
+		}
+		for _, username := range users {
+			jobs <- job{username, password}
+		}
+	}
+	return scanner.Err()
 }
 
 // uniqueStrings убирает дубликаты, сохраняя порядок.
@@ -332,21 +476,20 @@ func main() {
 		log.Fatal("Пользователи не загружены!")
 	}
 
-	// Загружаем пароли
-	var passwords []string
+	// Загружаем пароли (из -p; -P файл читается потоком, не грузится в память)
+	var inlinePws []string
 	if passwordFlagSet {
-		passwords = append(passwords, *passwordFlag)
+		inlinePws = []string{*passwordFlag}
 	}
+	pwCount := len(inlinePws)
 	if *passwordsFileFlag != "" {
-		lines, err := loadLinesFromFile(*passwordsFileFlag)
-		if err != nil {
-			log.Printf("Ошибка чтения файла с паролями: %v", err)
+		if n := countPasswordFileLines(*passwordsFileFlag); n > 0 {
+			pwCount += n
 		} else {
-			passwords = append(passwords, lines...)
+			log.Printf("Предупреждение: файл с паролями пустой или недоступен: %s", *passwordsFileFlag)
 		}
 	}
-	passwords = uniqueStrings(passwords)
-	if len(passwords) == 0 {
+	if pwCount == 0 {
 		log.Fatal("Пароли не загружены!")
 	}
 
@@ -360,15 +503,10 @@ func main() {
 	}()
 
 	// Сводка перед перебором
-	total := len(users) * len(passwords)
-	log.Printf("Пользователей: %d, паролей: %d, всего попыток: %d", len(users), len(passwords), total)
+	total := int64(len(users)) * int64(pwCount)
+	log.Printf("Пользователей: %d, паролей: %d, всего попыток: %d", len(users), pwCount, total)
 	if *verboseFlag {
 		log.Printf("Пользователи: %q", users)
-	}
-
-	type job struct {
-		username string
-		password string
 	}
 
 	workers := *threadsFlag
@@ -405,13 +543,14 @@ func main() {
 		}()
 	}
 
-	for _, password := range passwords {
+	for _, password := range inlinePws {
 		for _, username := range users {
-			if username == "" {
-				log.Printf("[WARN] Пустое имя пользователя, пропускаем")
-				continue
-			}
 			jobs <- job{username, password}
+		}
+	}
+	if *passwordsFileFlag != "" {
+		if err := feedPasswordsFromFile(*passwordsFileFlag, users, jobs); err != nil {
+			log.Printf("Ошибка чтения файла с паролями: %v", err)
 		}
 	}
 	close(jobs)
