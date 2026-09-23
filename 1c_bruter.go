@@ -33,6 +33,33 @@ import (
 // FIXED_IV используется для AES-CBC (для совместимости с 1С)
 var FIXED_IV = []byte{157, 123, 154, 32, 105, 101, 187, 40, 6, 122, 72, 61, 178, 108, 113, 142}
 
+// ANSI-цвета; отключаются когда вывод не в терминал или установлен NO_COLOR.
+var (
+	clReset  = ""
+	clBold   = ""
+	clGreen  = ""
+	clCyan   = ""
+	clYellow = ""
+	clGray   = ""
+	clRed    = ""
+)
+
+func init() {
+	if os.Getenv("NO_COLOR") != "" {
+		return
+	}
+	fi, err := os.Stderr.Stat()
+	if err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		clReset  = "\033[0m"
+		clBold   = "\033[1m"
+		clGreen  = "\033[32m"
+		clCyan   = "\033[36m"
+		clYellow = "\033[33m"
+		clGray   = "\033[90m"
+		clRed    = "\033[31m"
+	}
+}
+
 type job struct {
 	username string
 	password string
@@ -379,21 +406,20 @@ func uniqueStringsSorted(input []string) []string {
 	return result
 }
 
-// makeProgressBar возвращает ASCII прогресс-бар.
+// makeProgressBar возвращает цветной ASCII прогресс-бар.
 func makeProgressBar(done, total int64, width int) string {
 	if total == 0 {
-		return "[" + strings.Repeat("-", width) + "]"
+		return clGray + "[" + strings.Repeat("-", width) + "]" + clReset
 	}
 	filled := int(float64(done) / float64(total) * float64(width))
 	if filled > width {
 		filled = width
 	}
-	bar := strings.Repeat("=", filled)
+	inner := clGreen + strings.Repeat("=", filled)
 	if filled < width {
-		bar += ">"
-		bar += strings.Repeat(" ", width-filled-1)
+		inner += ">" + clReset + clGray + strings.Repeat(" ", width-filled-1)
 	}
-	return "[" + bar + "]"
+	return clGray + "[" + inner + clGray + "]" + clReset
 }
 
 // formatETA форматирует оставшееся время.
@@ -566,16 +592,20 @@ func main() {
 	}
 
 	// Шапка
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprintf(os.Stderr, "  Цель:    %s  (v%s)\n", baseURL, version)
+	modeStr := clCyan + "брут" + clReset
 	if sprayMode {
-		fmt.Fprintf(os.Stderr, "  Режим:   спрей  |  пользователей: %d  |  паролей: %d  |  попыток: %d\n",
-			len(users), pwTotal, total)
-	} else {
-		fmt.Fprintf(os.Stderr, "  Режим:   брут   |  пользователей: %d  |  паролей: %d  |  попыток: %d\n",
-			len(users), pwTotal, total)
+		modeStr = clYellow + "спрей" + clReset
 	}
-	fmt.Fprintf(os.Stderr, "  Потоков: %d\n\n", workers)
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintf(os.Stderr, "  %sЦель:%s    %s%s%s  %s(v%s)%s\n",
+		clBold, clReset, clCyan+clBold, baseURL, clReset, clGray, version, clReset)
+	fmt.Fprintf(os.Stderr, "  %sРежим:%s   %s  %s|%s  польз.: %s%d%s  %s|%s  паролей: %s%d%s  %s|%s  попыток: %s%d%s\n",
+		clBold, clReset, modeStr,
+		clGray, clReset, clBold, len(users), clReset,
+		clGray, clReset, clBold, pwTotal, clReset,
+		clGray, clReset, clBold, total, clReset)
+	fmt.Fprintf(os.Stderr, "  %sПотоков:%s %s%d%s\n\n",
+		clBold, clReset, clBold, workers, clReset)
 
 	jobs := make(chan job, workers*4)
 	var wg sync.WaitGroup
@@ -609,8 +639,12 @@ func main() {
 					}
 					pct := float64(n) * 100 / float64(total)
 					bar := makeProgressBar(n, total, 30)
-					line := fmt.Sprintf("  %s  %d/%d  %.1f%%  %.0f/s  ETA %s",
-						bar, n, total, pct, speed, eta)
+					line := fmt.Sprintf("  %s  %s%d%s/%d  %s%.1f%%%s  %s%.0f/s%s  ETA %s%s%s",
+						bar,
+						clBold, n, clReset, total,
+						clCyan, pct, clReset,
+						clGray, speed, clReset,
+						clYellow, eta, clReset)
 					mu.Lock()
 					fmt.Fprintf(os.Stderr, "\r%-80s", line)
 					mu.Unlock()
@@ -636,10 +670,13 @@ func main() {
 					if !*verboseFlag {
 						fmt.Fprintf(os.Stderr, "\r%-80s\r", "")
 					}
-					fmt.Printf("[+] %s : %s\n", j.username, j.password)
+					fmt.Printf("%s[+]%s %s%s%s : %s%s%s\n",
+						clGreen+clBold, clReset,
+						clCyan, j.username, clReset,
+						clYellow, j.password, clReset)
 					mu.Unlock()
 				} else if *verboseFlag {
-					log.Printf("[-] %s:%s", j.username, j.password)
+					log.Printf("%s[-]%s %s:%s", clGray, clReset, j.username, j.password)
 				}
 			}
 		}()
@@ -672,8 +709,15 @@ func main() {
 	progressWg.Wait()
 	elapsed := time.Since(start).Round(time.Second)
 	fmt.Fprintf(os.Stderr, "\r%-80s\r\n", "")
-	fmt.Fprintf(os.Stderr, "  Завершено  |  проверено: %d  |  найдено: %d  |  время: %s\n\n",
-		tried, len(results), elapsed)
+	foundColor := clGray
+	if len(results) > 0 {
+		foundColor = clGreen + clBold
+	}
+	fmt.Fprintf(os.Stderr, "  %sЗавершено%s  %s|%s  проверено: %s%d%s  %s|%s  найдено: %s%d%s  %s|%s  время: %s%s%s\n\n",
+		clBold, clReset,
+		clGray, clReset, clBold, tried, clReset,
+		clGray, clReset, foundColor, len(results), clReset,
+		clGray, clReset, clCyan, elapsed, clReset)
 
 	if *outputFlag != "" && len(results) > 0 {
 		if err := os.WriteFile(*outputFlag, []byte(strings.Join(results, "\n")), 0644); err != nil {
