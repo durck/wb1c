@@ -35,6 +35,7 @@ go build -o wb1c.exe 1c_bruter.go
 | `-P FILE` | ✓ | ✓ | File with passwords (one per line) |
 | `-l` | ✓ | ✓ | Fetch users list from the server |
 | `-v` | — | ✓ | Verbose: show every attempt including failures |
+| `-t INT` | — | ✓ | Number of concurrent threads (default: 1) |
 | `-o FILE` | ✓ | ✓ | Save results to file |
 
 ## Usage Examples
@@ -84,9 +85,8 @@ python 1c_bruter.py -U users.txt -p "Spring2024" https://target/InfoBase
 python 1c_bruter.py -U users.txt -P passwords.txt https://target/InfoBase
 ./wb1c    -U users.txt -P passwords.txt https://target/InfoBase
 
-# Save results
-python 1c_bruter.py -U users.txt -P passwords.txt -o results.txt https://target/InfoBase
-./wb1c    -U users.txt -P passwords.txt -o results.txt https://target/InfoBase
+# Go: 10 threads for large lists
+./wb1c -U users.txt -P passwords.txt -t 10 -o results.txt https://target/InfoBase
 ```
 
 ### Fetch users from server + bruteforce in one command

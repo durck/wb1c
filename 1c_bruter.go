@@ -22,6 +22,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"unicode"
 )
@@ -252,6 +254,7 @@ func main() {
 	passwordsFileFlag := flag.String("P", "", "Файл со списком паролей")
 	getUsersFlag := flag.Bool("l", false, "Получить список пользователей из информационной базы")
 	verboseFlag := flag.Bool("v", false, "Выводить все попытки, включая неудачные")
+	threadsFlag := flag.Int("t", 1, "Количество параллельных потоков")
 	outputFlag := flag.String("o", "", "Файл для сохранения результатов")
 
 	flag.Parse()
@@ -363,27 +366,57 @@ func main() {
 		log.Printf("Пользователи: %q", users)
 	}
 
-	tried := 0
+	type job struct {
+		username string
+		password string
+	}
+
+	workers := *threadsFlag
+	if workers < 1 {
+		workers = 1
+	}
+	log.Printf("Потоков: %d", workers)
+
+	jobs := make(chan job, workers*4)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var tried int64
 	var results []string
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				n := atomic.AddInt64(&tried, 1)
+				if *verboseFlag {
+					log.Printf("[%d/%d] Проверка: %s:%s", n, total, j.username, j.password)
+				}
+				if checkCredentials(baseURL, version, j.username, j.password) {
+					result := fmt.Sprintf("%s:%s", j.username, j.password)
+					mu.Lock()
+					results = append(results, result)
+					mu.Unlock()
+					log.Printf("[+] Успешная аутентификация! Пользователь: %s, Пароль: %s", j.username, j.password)
+				} else if *verboseFlag {
+					log.Printf("[-] Неудачно: %s:%s", j.username, j.password)
+				}
+			}
+		}()
+	}
+
 	for _, password := range passwords {
 		for _, username := range users {
 			if username == "" {
-				log.Printf("[WARN] Пустое имя пользователя в списке, пропускаем")
+				log.Printf("[WARN] Пустое имя пользователя, пропускаем")
 				continue
 			}
-			tried++
-			if *verboseFlag {
-				log.Printf("[%d/%d] Проверка: %s:%s", tried, total, username, password)
-			}
-			if checkCredentials(baseURL, version, username, password) {
-				result := fmt.Sprintf("%s:%s", username, password)
-				results = append(results, result)
-				log.Printf("[+] Успешная аутентификация! Пользователь: %s, Пароль: %s", username, password)
-			} else if *verboseFlag {
-				log.Printf("[-] Неудачно: %s:%s", username, password)
-			}
+			jobs <- job{username, password}
 		}
 	}
+	close(jobs)
+	wg.Wait()
+
 	log.Printf("Перебор завершён. Проверено: %d, найдено: %d", tried, len(results))
 
 	// Сохранение результатов в файл
