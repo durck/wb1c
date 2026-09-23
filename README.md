@@ -38,6 +38,36 @@ go build -o wb1c.exe 1c_bruter.go
 | `-t INT` | — | ✓ | Number of concurrent threads (default: 1) |
 | `-o FILE` | ✓ | ✓ | Save results to file |
 
+## File encoding (Go only)
+
+The Go version auto-detects the encoding of `-U` and `-P` files and handles:
+
+- **UTF-8** (default for Linux/macOS tools)
+- **UTF-8 BOM** (some editors)
+- **UTF-16 LE** — the default when you save a `.txt` file on Russian Windows (Notepad, Excel export)
+- **UTF-16 BE**
+
+No flags needed — BOM detection is automatic.
+
+## Memory model (Go only)
+
+For large-scale attacks, the Go version streams files instead of loading them fully into memory.
+The mode is chosen automatically by comparing file sizes:
+
+| Scenario | Auto-selected mode | Streamed | In memory |
+|----------|--------------------|----------|-----------|
+| Spray: big user list + 1–few passwords | **Spray** | `-U` file | passwords |
+| Brute: small user list + big wordlist | **Brute** | `-P` file | users |
+| Mixed: both files provided | Whichever file is **larger** gets streamed | larger file | smaller file |
+
+The selected mode is printed before the run starts:
+```
+Режим: спрей (стриминг пользователей из файла)
+Режим: брут (стриминг паролей из файла)
+```
+
+This means a 14M-entry wordlist (rockyou) or a 200k-entry AD user dump both work without filling RAM.
+
 ## Usage Examples
 
 ### Recon — get users list
@@ -77,6 +107,9 @@ python 1c_bruter.py -u Accountant -P passwords.txt https://target/InfoBase
 ```bash
 python 1c_bruter.py -U users.txt -p "Spring2024" https://target/InfoBase
 ./wb1c    -U users.txt -p "Spring2024" https://target/InfoBase
+
+# Go: large AD dump — auto spray mode, 10 threads
+./wb1c -U ad_users.txt -p "Spring2024!" -t 10 -o hits.txt https://target/InfoBase
 ```
 
 ### Credential stuffing — user list + password list
@@ -85,7 +118,7 @@ python 1c_bruter.py -U users.txt -p "Spring2024" https://target/InfoBase
 python 1c_bruter.py -U users.txt -P passwords.txt https://target/InfoBase
 ./wb1c    -U users.txt -P passwords.txt https://target/InfoBase
 
-# Go: 10 threads for large lists
+# Go: 10 threads; mode (spray vs brute) is chosen automatically
 ./wb1c -U users.txt -P passwords.txt -t 10 -o results.txt https://target/InfoBase
 ```
 
