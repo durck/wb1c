@@ -369,6 +369,54 @@ func feedPasswordsFromFile(filename string, users []string, jobs chan<- job) err
 	return scanner.Err()
 }
 
+// feedUsersFromFile читает файл пользователей построчно и отправляет задачи в канал.
+// Используется в спрей-режиме: пользователи — внешний цикл, пароли — в памяти.
+func feedUsersFromFile(filename string, passwords []string, jobs chan<- job) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	bom := make([]byte, 3)
+	n, _ := f.Read(bom)
+	f.Close()
+	bom = bom[:n]
+
+	isUTF16 := (n >= 2 && bom[0] == 0xFF && bom[1] == 0xFE) ||
+		(n >= 2 && bom[0] == 0xFE && bom[1] == 0xFF)
+	if isUTF16 {
+		lines, err := loadLinesFromFile(filename)
+		if err != nil {
+			return err
+		}
+		for _, username := range lines {
+			for _, password := range passwords {
+				jobs <- job{username, password}
+			}
+		}
+		return nil
+	}
+
+	f2, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer f2.Close()
+	if n >= 3 && bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
+		f2.Seek(3, io.SeekStart)
+	}
+	scanner := bufio.NewScanner(f2)
+	for scanner.Scan() {
+		username := strings.TrimSpace(scanner.Text())
+		if username == "" {
+			continue
+		}
+		for _, password := range passwords {
+			jobs <- job{username, password}
+		}
+	}
+	return scanner.Err()
+}
+
 // uniqueStrings убирает дубликаты, сохраняя порядок.
 func uniqueStrings(input []string) []string {
 	seen := make(map[string]bool)
@@ -450,12 +498,38 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Загружаем пользователей
+	// Подсчёт файлов для выбора режима (без загрузки в память)
+	usersFileCount := 0
+	if *usersFileFlag != "" {
+		usersFileCount = countPasswordFileLines(*usersFileFlag)
+		if usersFileCount == 0 {
+			log.Printf("Предупреждение: файл с пользователями пустой или недоступен: %s", *usersFileFlag)
+		}
+	}
+
+	var inlinePws []string
+	if passwordFlagSet {
+		inlinePws = []string{*passwordFlag}
+	}
+	pwCount := len(inlinePws)
+	if *passwordsFileFlag != "" {
+		if n := countPasswordFileLines(*passwordsFileFlag); n > 0 {
+			pwCount += n
+		} else {
+			log.Printf("Предупреждение: файл с паролями пустой или недоступен: %s", *passwordsFileFlag)
+		}
+	}
+
+	// Спрей-режим: файл пользователей > файл паролей → стримим пользователей, пароли в памяти.
+	// Брут-режим: иначе → стримим пароли, пользователей в памяти.
+	sprayMode := *usersFileFlag != "" && usersFileCount > pwCount
+
+	// Загружаем пользователей (в брут-режиме грузим файл; в спрей-режиме только -u и -l)
 	var users []string
 	if *userFlag != "" {
 		users = append(users, *userFlag)
 	}
-	if *usersFileFlag != "" {
+	if !sprayMode && *usersFileFlag != "" {
 		lines, err := loadLinesFromFile(*usersFileFlag)
 		if err != nil {
 			log.Printf("Ошибка чтения файла с пользователями: %v", err)
@@ -472,23 +546,30 @@ func main() {
 		}
 	}
 	users = uniqueStringsSorted(users)
-	if len(users) == 0 {
+
+	totalUsers := int64(len(users))
+	if sprayMode {
+		totalUsers += int64(usersFileCount)
+	}
+	if totalUsers == 0 {
 		log.Fatal("Пользователи не загружены!")
 	}
 
-	// Загружаем пароли (из -p; -P файл читается потоком, не грузится в память)
-	var inlinePws []string
-	if passwordFlagSet {
-		inlinePws = []string{*passwordFlag}
-	}
-	pwCount := len(inlinePws)
-	if *passwordsFileFlag != "" {
-		if n := countPasswordFileLines(*passwordsFileFlag); n > 0 {
-			pwCount += n
-		} else {
-			log.Printf("Предупреждение: файл с паролями пустой или недоступен: %s", *passwordsFileFlag)
+	// В спрей-режиме загружаем пароли в память (их мало — это суть спрея)
+	var sprayPws []string
+	if sprayMode {
+		sprayPws = append(sprayPws, inlinePws...)
+		if *passwordsFileFlag != "" {
+			lines, err := loadLinesFromFile(*passwordsFileFlag)
+			if err != nil {
+				log.Printf("Ошибка чтения файла с паролями: %v", err)
+			} else {
+				sprayPws = append(sprayPws, lines...)
+			}
 		}
+		sprayPws = uniqueStrings(sprayPws)
 	}
+
 	if pwCount == 0 {
 		log.Fatal("Пароли не загружены!")
 	}
@@ -503,10 +584,15 @@ func main() {
 	}()
 
 	// Сводка перед перебором
-	total := int64(len(users)) * int64(pwCount)
-	log.Printf("Пользователей: %d, паролей: %d, всего попыток: %d", len(users), pwCount, total)
-	if *verboseFlag {
-		log.Printf("Пользователи: %q", users)
+	total := totalUsers * int64(pwCount)
+	log.Printf("Пользователей: %d, паролей: %d, всего попыток: %d", totalUsers, pwCount, total)
+	if sprayMode {
+		log.Printf("Режим: спрей (стриминг пользователей из файла)")
+	} else if *passwordsFileFlag != "" {
+		log.Printf("Режим: брут (стриминг паролей из файла)")
+	}
+	if *verboseFlag && len(users) > 0 {
+		log.Printf("Пользователи (в памяти): %q", users)
 	}
 
 	workers := *threadsFlag
@@ -543,14 +629,29 @@ func main() {
 		}()
 	}
 
-	for _, password := range inlinePws {
+	if sprayMode {
+		// Спрей: стримим пользователей, пароли в памяти
 		for _, username := range users {
-			jobs <- job{username, password}
+			for _, password := range sprayPws {
+				jobs <- job{username, password}
+			}
 		}
-	}
-	if *passwordsFileFlag != "" {
-		if err := feedPasswordsFromFile(*passwordsFileFlag, users, jobs); err != nil {
-			log.Printf("Ошибка чтения файла с паролями: %v", err)
+		if *usersFileFlag != "" {
+			if err := feedUsersFromFile(*usersFileFlag, sprayPws, jobs); err != nil {
+				log.Printf("Ошибка чтения файла с пользователями: %v", err)
+			}
+		}
+	} else {
+		// Брут: стримим пароли, пользователи в памяти
+		for _, password := range inlinePws {
+			for _, username := range users {
+				jobs <- job{username, password}
+			}
+		}
+		if *passwordsFileFlag != "" {
+			if err := feedPasswordsFromFile(*passwordsFileFlag, users, jobs); err != nil {
+				log.Printf("Ошибка чтения файла с паролями: %v", err)
+			}
 		}
 	}
 	close(jobs)
